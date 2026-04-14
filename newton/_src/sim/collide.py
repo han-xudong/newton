@@ -806,6 +806,7 @@ class CollisionPipeline:
         model = self.model
         # update any additional parameters
         soft_contact_margin = soft_contact_margin if soft_contact_margin is not None else self.soft_contact_margin
+        contacts.soft_contact_margin = float(soft_contact_margin)
 
         # Rigid contact detection -- broad phase + narrow phase.
         # These kernels hardcode record_tape=False internally so they are

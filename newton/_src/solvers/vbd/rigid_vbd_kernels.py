@@ -2331,6 +2331,137 @@ def compute_rigid_contact_forces(
 
 
 @wp.kernel
+def pack_rigid_contact_forces_to_spatial(
+    rigid_contact_count: wp.array[int],
+    contact_body0: wp.array[wp.int32],
+    contact_point0_world: wp.array[wp.vec3],
+    force_on_body1: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
+    # output
+    contact_force: wp.array[wp.spatial_vector],
+):
+    """Pack rigid contact forces into ``Contacts.force`` spatial vectors."""
+    contact_idx = wp.tid()
+    rc = rigid_contact_count[0]
+    if contact_idx >= rc:
+        return
+
+    body0 = contact_body0[contact_idx]
+    force_on_body0 = -force_on_body1[contact_idx]
+    torque_on_body0 = wp.vec3(0.0)
+
+    if body0 >= 0:
+        com_world = wp.transform_point(body_q[body0], body_com[body0])
+        moment_arm = contact_point0_world[contact_idx] - com_world
+        torque_on_body0 = wp.cross(moment_arm, force_on_body0)
+
+    contact_force[contact_idx] = wp.spatial_vector(force_on_body0, torque_on_body0)
+
+
+@wp.kernel
+def compute_soft_contact_forces(
+    dt: float,
+    soft_contact_margin: float,
+    rigid_contact_count: wp.array[int],
+    soft_contact_count: wp.array[int],
+    particle_q_prev: wp.array[wp.vec3],
+    particle_q: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    body_particle_contact_penalty_k: wp.array[float],
+    body_particle_contact_material_kd: wp.array[float],
+    body_particle_contact_material_mu: wp.array[float],
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    contact_particle: wp.array[int],
+    contact_shape: wp.array[int],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_body_vel: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    friction_epsilon: float,
+    # output
+    contact_force: wp.array[wp.spatial_vector],
+):
+    """Compute exported soft-contact spatial forces and append them after rigid rows."""
+    contact_idx = wp.tid()
+    sc = soft_contact_count[0]
+    if contact_idx >= sc:
+        return
+
+    particle_index = contact_particle[contact_idx]
+    shape_index = contact_shape[contact_idx]
+    if particle_index < 0 or shape_index < 0:
+        contact_force[rigid_contact_count[0] + contact_idx] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+        return
+
+    body_index = shape_body[shape_index]
+    X_wb = wp.transform_identity()
+    X_com = wp.vec3()
+    if body_index >= 0:
+        X_wb = body_q[body_index]
+        X_com = body_com[body_index]
+
+    body_pos_world = contact_body_pos[contact_idx]
+    body_vel_world = contact_body_vel[contact_idx]
+    if body_index >= 0:
+        body_pos_world = wp.transform_point(X_wb, body_pos_world)
+        if body_q_prev:
+            X_wb_prev = body_q_prev[body_index]
+            body_pos_prev = wp.transform_point(X_wb_prev, contact_body_pos[contact_idx])
+            body_vel_world = (body_pos_world - body_pos_prev) / dt + wp.transform_vector(X_wb, contact_body_vel[contact_idx])
+        else:
+            body_vel_world = wp.transform_vector(X_wb, contact_body_vel[contact_idx])
+            body_v_s = body_qd[body_index]
+            com_world = wp.transform_point(X_wb, X_com)
+            point_offset = body_pos_world - com_world
+            body_vel_world = (
+                body_vel_world
+                + wp.spatial_top(body_v_s)
+                + wp.cross(wp.spatial_bottom(body_v_s), point_offset)
+            )
+
+    normal = contact_normal[contact_idx]
+    particle_pos = particle_q[particle_index]
+    particle_prev_pos = particle_q_prev[particle_index]
+    penetration_depth = -(wp.dot(normal, particle_pos - body_pos_world) - particle_radius[particle_index] - soft_contact_margin)
+    if penetration_depth <= 0.0:
+        contact_force[rigid_contact_count[0] + contact_idx] = wp.spatial_vector(wp.vec3(0.0), wp.vec3(0.0))
+        return
+
+    normal_load = penetration_depth * body_particle_contact_penalty_k[contact_idx]
+    force_on_particle = normal * normal_load
+    particle_dx = particle_pos - particle_prev_pos
+    normal_dx = wp.dot(normal, particle_dx)
+    if normal_dx < 0.0:
+        damping_coeff = body_particle_contact_material_kd[contact_idx] * body_particle_contact_penalty_k[contact_idx]
+        force_on_particle = force_on_particle - ((damping_coeff / dt) * normal_dx) * normal
+
+    tangential_translation = particle_dx - body_vel_world * dt
+    tangential_translation = tangential_translation - normal * wp.dot(normal, tangential_translation)
+    tangential_norm = wp.length(tangential_translation)
+    if tangential_norm > 0.0:
+        friction_mu = wp.max(body_particle_contact_material_mu[contact_idx], 0.0)
+        eps_u = friction_epsilon * dt
+        scale = 0.0
+        if tangential_norm > eps_u:
+            scale = friction_mu * normal_load / tangential_norm
+        else:
+            scale = friction_mu * normal_load * ((-tangential_norm / eps_u + 2.0) / eps_u)
+        force_on_particle = force_on_particle - scale * tangential_translation
+
+    force_on_body = -force_on_particle
+    torque_on_body = wp.vec3(0.0)
+    if body_index >= 0:
+        com_world = wp.transform_point(X_wb, X_com)
+        torque_on_body = wp.cross(body_pos_world - com_world, force_on_body)
+
+    contact_force[rigid_contact_count[0] + contact_idx] = wp.spatial_vector(force_on_body, torque_on_body)
+
+
+@wp.kernel
 def accumulate_body_particle_contacts_per_body(
     dt: float,
     color_group: wp.array[wp.int32],

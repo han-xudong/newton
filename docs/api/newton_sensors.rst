@@ -17,4 +17,5 @@ newton.sensors
    SensorFrameTransform
    SensorIMU
    SensorRaycast
+   SensorTactileArray
    SensorTiledCamera

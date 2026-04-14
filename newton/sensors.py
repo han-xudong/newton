@@ -5,6 +5,9 @@
 from ._src.sensors.sensor_contact import (
     SensorContact,
 )
+from ._src.sensors.sensor_tactile_array import (
+    SensorTactileArray,
+)
 
 # Frame transform sensors
 from ._src.sensors.sensor_frame_transform import (
@@ -28,6 +31,7 @@ from ._src.sensors.sensor_tiled_camera import (
 
 __all__ = [
     "SensorContact",
+    "SensorTactileArray",
     "SensorFrameTransform",
     "SensorIMU",
     "SensorRaycast",

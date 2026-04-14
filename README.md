@@ -367,6 +367,9 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="https://github.com/newton-physics/newton/blob/main/newton/examples/cloth/example_cloth_tactile_array.py">
+        <img width="320" src="https://raw.githubusercontent.com/newton-physics/newton/main/docs/images/examples/example_cloth_tactile_array.jpg" alt="Cloth Tactile Array">
+      </a>
     </td>
   </tr>
   <tr>
@@ -377,6 +380,7 @@ If you installed from source with uv, substitute `uv run` for `python` in the co
       <code>python -m newton.examples cloth_poker_cards</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples cloth_tactile_array --cloth-verts-width 11 --cloth-verts-length 9 --cloth-width 0.25 --cloth-length 0.20</code>
     </td>
   </tr>
   <tr>

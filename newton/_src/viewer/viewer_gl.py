@@ -220,6 +220,7 @@ class ViewerGL(ViewerBase):
         self._scalar_arrays: dict[str, np.ndarray | None] = {}
         self._scalar_accumulators: dict[str, list[float]] = {}
         self._scalar_smoothing: dict[str, int] = {}
+        self._array_buffers: dict[str, np.ndarray] = {}
         self._plot_history_size = plot_history_size
 
         super().__init__()
@@ -1222,13 +1223,28 @@ class ViewerGL(ViewerBase):
     @override
     def log_array(self, name: str, array: wp.array[Any] | np.ndarray):
         """
-        Log a generic array for visualization (not implemented).
+        Log a numeric array for visualization.
 
         Args:
             name: Unique path/name for the array signal.
             array: Array data to visualize.
         """
-        pass
+        if array is None:
+            self._array_buffers.pop(name, None)
+            return
+
+        array_np = array.numpy() if isinstance(array, wp.array) else np.asarray(array)
+        array_np = np.asarray(array_np, dtype=np.float32)
+        array_np = np.squeeze(array_np)
+
+        if array_np.ndim == 0:
+            array_np = array_np.reshape(1, 1)
+        elif array_np.ndim == 1:
+            array_np = array_np.reshape(1, -1)
+        elif array_np.ndim != 2:
+            raise ValueError("ViewerGL.log_array only supports scalar, 1-D, or 2-D arrays.")
+
+        self._array_buffers[name] = np.ascontiguousarray(array_np)
 
     @override
     def log_scalar(
@@ -2325,18 +2341,85 @@ class ViewerGL(ViewerBase):
 
         imgui.end()
 
+    @staticmethod
+    def _heatmap_color(value: float) -> tuple[float, float, float]:
+        t = float(np.clip(value, 0.0, 1.0))
+        inferno_stops = (
+            (0.0, (0.001, 0.000, 0.014)),
+            (0.2, (0.169, 0.042, 0.341)),
+            (0.4, (0.416, 0.090, 0.433)),
+            (0.6, (0.698, 0.165, 0.388)),
+            (0.8, (0.944, 0.403, 0.121)),
+            (1.0, (0.988, 0.998, 0.645)),
+        )
+        for index in range(len(inferno_stops) - 1):
+            t0, c0 = inferno_stops[index]
+            t1, c1 = inferno_stops[index + 1]
+            if t <= t1:
+                alpha = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+                return tuple(float((1.0 - alpha) * c0[channel] + alpha * c1[channel]) for channel in range(3))
+        return inferno_stops[-1][1]
+
+    def _render_array_heatmap(self, name: str, array: np.ndarray, width: float):
+        imgui = self.ui.imgui
+
+        rows, cols = array.shape
+        heatmap_width = max(120.0, width)
+        heatmap_height = np.clip(heatmap_width * rows / max(cols, 1), 80.0, 220.0)
+        cell_width = heatmap_width / max(cols, 1)
+        cell_height = heatmap_height / max(rows, 1)
+
+        finite_mask = np.isfinite(array)
+        if np.any(finite_mask):
+            finite_values = array[finite_mask]
+            value_min = float(np.min(finite_values))
+            value_max = float(np.max(finite_values))
+        else:
+            value_min = 0.0
+            value_max = 0.0
+
+        denom = max(value_max - value_min, 1.0e-8)
+        draw_list = imgui.get_window_draw_list()
+        origin = imgui.get_cursor_screen_pos()
+
+        for row in range(rows):
+            for col in range(cols):
+                value = float(array[row, col])
+                if np.isfinite(value):
+                    normalized = (value - value_min) / denom
+                    color_rgb = self._heatmap_color(normalized)
+                else:
+                    color_rgb = (0.2, 0.2, 0.2)
+                color_u32 = imgui.color_convert_float4_to_u32(imgui.ImVec4(*color_rgb, 1.0))
+
+                x0 = origin.x + col * cell_width
+                y0 = origin.y + (rows - 1 - row) * cell_height
+                x1 = origin.x + (col + 1) * cell_width
+                y1 = y0 + cell_height
+                draw_list.add_rect_filled(imgui.ImVec2(x0, y0), imgui.ImVec2(x1, y1), color_u32)
+
+        border_color = imgui.color_convert_float4_to_u32(imgui.ImVec4(1.0, 1.0, 1.0, 0.25))
+        draw_list.add_rect(
+            imgui.ImVec2(origin.x, origin.y),
+            imgui.ImVec2(origin.x + heatmap_width, origin.y + heatmap_height),
+            border_color,
+        )
+        imgui.dummy(imgui.ImVec2(heatmap_width, heatmap_height))
+        imgui.text(f"shape {rows}x{cols}  min {value_min:.4g}  max {value_max:.4g}")
+
     def _render_scalar_plots(self):
-        """Render an ImGui window with live line plots for all logged scalars."""
-        if not self._scalar_buffers:
+        """Render an ImGui window with live line plots and array heatmaps."""
+        if not self._scalar_buffers and not self._array_buffers:
             return
 
         imgui = self.ui.imgui
         io = self.ui.io
 
         window_width = 400
+        item_height = len(self._scalar_buffers) * 140 + len(self._array_buffers) * 260
         window_height = min(
             io.display_size[1] - 20,
-            len(self._scalar_buffers) * 140 + 60,
+            item_height + 60,
         )
         imgui.set_next_window_pos(
             imgui.ImVec2(io.display_size[0] - window_width - 10, 10),
@@ -2365,6 +2448,13 @@ class ViewerGL(ViewerBase):
                     imgui.TreeNodeFlags_.default_open.value,
                 ):
                     imgui.plot_lines(f"##{name}", arr, graph_size=graph_size, overlay_text=overlay)
+
+            for name, array in self._array_buffers.items():
+                if imgui.collapsing_header(
+                    name,
+                    imgui.TreeNodeFlags_.default_open.value,
+                ):
+                    self._render_array_heatmap(name, array, window_width - 40.0)
         imgui.end()
 
     def _render_stats_overlay(self):

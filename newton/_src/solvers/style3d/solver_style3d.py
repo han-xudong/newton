@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
+from ..contact_force_export import fill_vbd_like_soft_contact_force_rows
 from ..solver import SolverBase
 from .builder import PDMatrixBuilder
 from .collision import Collision
@@ -128,6 +130,7 @@ class SolverStyle3D(SolverBase):
         self.nonlinear_iterations = iterations
         self.drag_spring_stiff = drag_spring_stiff
         self.enable_mouse_dragging = enable_mouse_dragging
+        self._last_dt: float | None = None
         self.pd_matrix_builder = PDMatrixBuilder(model.particle_count)
         self.linear_solver = PcgSolver(model.particle_count, self.device)
 
@@ -167,6 +170,8 @@ class SolverStyle3D(SolverBase):
             contacts: :class:`newton.Contacts` used for collision response.
             dt: Time step in seconds.
         """
+        self._last_dt = float(dt)
+
         if self.collision is not None:
             self.collision.frame_begin(state_in.particle_q, state_in.particle_qd, dt)
 
@@ -331,6 +336,51 @@ class SolverStyle3D(SolverBase):
 
         if self.collision is not None:
             self.collision.frame_end(state_out.particle_q, state_out.particle_qd, dt)
+
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        """Populate soft ``contacts.force`` rows using the Style3D body-contact model."""
+        if state is None:
+            raise ValueError("state cannot be None when calling SolverStyle3D.update_contacts")
+        if contacts.force is None:
+            raise ValueError("Contacts.force is None. Request the extended contact attribute 'force' first.")
+        if self._last_dt is None:
+            raise ValueError("SolverStyle3D.update_contacts requires a completed solver step before contact forces are available.")
+
+        contacts.force.zero_()
+        soft_count = int(contacts.soft_contact_count.numpy()[0])
+        if soft_count <= 0:
+            return
+
+        soft_contact_margin = float(getattr(contacts, "soft_contact_margin", 0.0))
+        force_rows = contacts.force.numpy()
+        fill_vbd_like_soft_contact_force_rows(
+            force_rows,
+            int(contacts.rigid_contact_count.numpy()[0]),
+            particle_q=state.particle_q.numpy(),
+            particle_q_prev=self.x_prev.numpy(),
+            particle_radius=self.model.particle_radius.numpy(),
+            shape_body=self.model.shape_body.numpy(),
+            shape_material_mu=self.model.shape_material_mu.numpy(),
+            body_q=state.body_q.numpy() if state.body_q is not None else None,
+            body_q_prev=state.body_q.numpy() if state.body_q is not None else None,
+            body_qd=state.body_qd.numpy() if state.body_qd is not None else None,
+            body_com=self.model.body_com.numpy() if self.model.body_com is not None else None,
+            contact_particle=contacts.soft_contact_particle.numpy()[:soft_count],
+            contact_shape=contacts.soft_contact_shape.numpy()[:soft_count],
+            contact_body_pos=contacts.soft_contact_body_pos.numpy()[:soft_count],
+            contact_body_vel=contacts.soft_contact_body_vel.numpy()[:soft_count],
+            contact_normal=contacts.soft_contact_normal.numpy()[:soft_count],
+            contact_ke=np.full(soft_count, float(self.model.soft_contact_ke), dtype=np.float32),
+            contact_kd=np.full(soft_count, float(self.model.soft_contact_kd), dtype=np.float32),
+            contact_mu=np.sqrt(
+                float(self.model.soft_contact_mu) * self.model.shape_material_mu.numpy()[contacts.soft_contact_shape.numpy()[:soft_count]]
+            ).astype(np.float32, copy=False),
+            soft_contact_margin=soft_contact_margin,
+            friction_epsilon=float(self.collision.friction_epsilon) if self.collision is not None else 1.0e-2,
+            dt=float(self._last_dt),
+        )
+        contacts.force.assign(force_rows)
 
     def rebuild_bvh(self, state: State):
         if self.collision is not None:
