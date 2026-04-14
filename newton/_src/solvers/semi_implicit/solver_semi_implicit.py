@@ -5,6 +5,7 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, State
+from ..contact_force_export import fill_semi_implicit_soft_contact_force_rows
 from ..solver import SolverBase
 from .kernels_body import (
     eval_body_joint_forces,
@@ -90,6 +91,7 @@ class SolverSemiImplicit(SolverBase):
         self.joint_attach_ke = joint_attach_ke
         self.joint_attach_kd = joint_attach_kd
         self.enable_tri_contact = enable_tri_contact
+        self._last_dt: float | None = None
 
     @override
     def step(
@@ -118,6 +120,8 @@ class SolverSemiImplicit(SolverBase):
             for simulations involving particle collisions.
             To disable it, set :attr:`newton.Model.particle_grid` to `None` prior to calling :meth:`step`.
         """
+        self._last_dt = float(dt)
+
         with wp.ScopedTimer("simulate", False):
             particle_f = None
             body_f = None
@@ -183,3 +187,50 @@ class SolverSemiImplicit(SolverBase):
                 state_in.body_f = body_f_work
                 self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
                 state_in.body_f = body_f_prev
+
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        """Populate soft ``contacts.force`` rows using the semi-implicit contact model."""
+        if state is None:
+            raise ValueError("state cannot be None when calling SolverSemiImplicit.update_contacts")
+        if contacts.force is None:
+            raise ValueError("Contacts.force is None. Request the extended contact attribute 'force' first.")
+        if self._last_dt is None:
+            raise ValueError(
+                "SolverSemiImplicit.update_contacts requires a completed solver step before contact forces are available."
+            )
+
+        contacts.force.zero_()
+        soft_count = int(contacts.soft_contact_count.numpy()[0])
+        if soft_count <= 0:
+            return
+
+        force_rows = contacts.force.numpy()
+        fill_semi_implicit_soft_contact_force_rows(
+            force_rows,
+            int(contacts.rigid_contact_count.numpy()[0]),
+            particle_q=state.particle_q.numpy(),
+            particle_qd=state.particle_qd.numpy(),
+            particle_radius=self.model.particle_radius.numpy(),
+            particle_flags=self.model.particle_flags.numpy(),
+            body_q=state.body_q.numpy() if state.body_q is not None else None,
+            body_qd=state.body_qd.numpy() if state.body_qd is not None else None,
+            body_com=self.model.body_com.numpy() if self.model.body_com is not None else None,
+            shape_body=self.model.shape_body.numpy(),
+            shape_material_ke=self.model.shape_material_ke.numpy(),
+            shape_material_kd=self.model.shape_material_kd.numpy(),
+            shape_material_kf=self.model.shape_material_kf.numpy(),
+            shape_material_mu=self.model.shape_material_mu.numpy(),
+            shape_material_ka=self.model.shape_material_ka.numpy(),
+            particle_ke=float(self.model.soft_contact_ke),
+            particle_kd=float(self.model.soft_contact_kd),
+            particle_kf=float(self.model.soft_contact_kf),
+            particle_mu=float(self.model.soft_contact_mu),
+            particle_ka=float(self.model.particle_adhesion),
+            contact_particle=contacts.soft_contact_particle.numpy()[:soft_count],
+            contact_shape=contacts.soft_contact_shape.numpy()[:soft_count],
+            contact_body_pos=contacts.soft_contact_body_pos.numpy()[:soft_count],
+            contact_body_vel=contacts.soft_contact_body_vel.numpy()[:soft_count],
+            contact_normal=contacts.soft_contact_normal.numpy()[:soft_count],
+        )
+        contacts.force.assign(force_rows)

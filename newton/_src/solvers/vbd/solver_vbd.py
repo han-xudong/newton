@@ -61,8 +61,11 @@ from .rigid_vbd_kernels import (
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
     check_contact_overflow,
+    compute_soft_contact_forces,
     compute_cable_dahl_parameters,
     compute_rigid_contact_forces,
+    copy_rigid_body_transforms_back,
+    pack_rigid_contact_forces_to_spatial,
     forward_step_rigid_bodies,
     init_body_body_contact_materials,
     init_body_body_contacts_avbd,
@@ -365,6 +368,7 @@ class SolverVBD(SolverBase):
         # Common parameters
         self.iterations = iterations
         self.friction_epsilon = friction_epsilon
+        self._last_dt: float | None = None
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
@@ -1540,6 +1544,7 @@ class SolverVBD(SolverBase):
         """
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
+        self._last_dt = float(dt)
 
         if control is None:
             control = self.model.control(clone_variables=False)
@@ -2670,6 +2675,131 @@ class SolverVBD(SolverBase):
             contacts.rigid_contact_force,
             contacts.rigid_contact_count,
         )
+
+    @override
+    def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:
+        """Populate ``contacts.force`` with VBD rigid and soft contact forces.
+
+        Args:
+            contacts: Contact buffers produced by collision detection.
+            state: Simulation state used for force evaluation.
+
+        Raises:
+            ValueError: If ``state`` is None, ``contacts.force`` is not allocated, or no timestep is available.
+        """
+        if state is None:
+            raise ValueError("state cannot be None when calling SolverVBD.update_contacts")
+        if contacts.force is None:
+            raise ValueError("Contacts.force is None. Request the extended contact attribute 'force' first.")
+        if self._last_dt is None:
+            raise ValueError("SolverVBD.update_contacts requires a completed solver step before contact forces are available.")
+
+        dt = float(self._last_dt)
+        contacts.force.zero_()
+        has_rigid_contact_buffers = hasattr(self, "body_body_contact_penalty_k")
+        soft_contact_margin = float(getattr(contacts, "soft_contact_margin", 0.0))
+
+        if contacts.rigid_contact_max > 0 and has_rigid_contact_buffers:
+            wp.launch(
+                kernel=warmstart_body_body_contacts,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    self.model.shape_material_ke,
+                    self.model.shape_material_kd,
+                    self.model.shape_material_mu,
+                    self.k_start_body_contact,
+                ],
+                outputs=[
+                    self.body_body_contact_penalty_k,
+                    self.body_body_contact_material_ke,
+                    self.body_body_contact_material_kd,
+                    self.body_body_contact_material_mu,
+                ],
+                device=self.device,
+            )
+
+        if contacts.soft_contact_max > 0:
+            wp.launch(
+                kernel=warmstart_body_particle_contacts,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_shape,
+                    self.model.soft_contact_ke,
+                    self.model.soft_contact_kd,
+                    self.model.soft_contact_mu,
+                    self.model.shape_material_ke,
+                    self.model.shape_material_kd,
+                    self.model.shape_material_mu,
+                    self.k_start_body_contact,
+                ],
+                outputs=[
+                    self.body_particle_contact_penalty_k,
+                    self.body_particle_contact_material_ke,
+                    self.body_particle_contact_material_kd,
+                    self.body_particle_contact_material_mu,
+                ],
+                device=self.device,
+            )
+
+        (
+            rigid_body0,
+            _rigid_body1,
+            rigid_point0_world,
+            _rigid_point1_world,
+            rigid_force_on_body1,
+            rigid_contact_count,
+        ) = self.collect_rigid_contact_forces(state, contacts, dt)
+
+        if contacts.rigid_contact_max > 0 and has_rigid_contact_buffers:
+            wp.launch(
+                kernel=pack_rigid_contact_forces_to_spatial,
+                dim=contacts.rigid_contact_max,
+                inputs=[
+                    rigid_contact_count,
+                    rigid_body0,
+                    rigid_point0_world,
+                    rigid_force_on_body1,
+                    state.body_q,
+                    self.model.body_com,
+                ],
+                outputs=[contacts.force],
+                device=self.device,
+            )
+
+        if contacts.soft_contact_max > 0:
+            wp.launch(
+                kernel=compute_soft_contact_forces,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    dt,
+                    float(getattr(contacts, "soft_contact_margin", 0.0)),
+                    contacts.rigid_contact_count,
+                    contacts.soft_contact_count,
+                    self.particle_q_prev,
+                    state.particle_q,
+                    self.model.particle_radius,
+                    self.body_particle_contact_penalty_k,
+                    self.body_particle_contact_material_kd,
+                    self.body_particle_contact_material_mu,
+                    self.model.shape_body,
+                    state.body_q if state.body_q is not None else self._empty_body_q,
+                    getattr(self, "body_q_prev", self._empty_body_q),
+                    state.body_qd if state.body_qd is not None else self._empty_body_qd,
+                    self.model.body_com if self.model.body_com is not None else self._empty_body_com,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
+                    float(self.friction_epsilon),
+                ],
+                outputs=[contacts.force],
+                device=self.device,
+            )
 
     def _finalize_particles(self, state_out: State, dt: float):
         """Finalize particle velocities after VBD iterations."""

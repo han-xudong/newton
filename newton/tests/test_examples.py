@@ -341,6 +341,14 @@ add_example_test(
     test_options={"num-frames": 200},
     use_viewer=True,
 )
+add_example_test(
+    TestClothExamples,
+    name="cloth.example_cloth_tactile_array",
+    devices=test_devices,
+    test_options={"num-frames": 80},
+    test_options_cpu={"num-frames": 60},
+    use_viewer=True,
+)
 
 
 class TestRobotExamples(unittest.TestCase):

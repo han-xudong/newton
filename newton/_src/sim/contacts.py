@@ -271,6 +271,8 @@ class Contacts:
             self.soft_contact_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact normal direction [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_tids = wp.full(soft_contact_max, -1, dtype=int)
+            self.soft_contact_margin = 0.0
+            """Soft-contact activation margin [m] used when these contacts were generated."""
 
             # Extended contact attributes (optional, allocated on demand)
             self.force: wp.array | None = None

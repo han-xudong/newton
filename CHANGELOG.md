@@ -105,6 +105,9 @@
 
 ### Added
 
+- Add `SensorTactileArray` as a public soft-contact tactile sensor that aggregates particle-skin contacts into taxel-level normal and shear force maps
+- Add `official_contact_count`, `estimated_contact_count`, and `official_coverage_ratio` diagnostics to `SensorTactileArray` to report how much tactile data came from official solver-exported soft-contact force rows versus fallback reconstruction
+- Add `cloth_tactile_array` example showing `SensorTactileArray` on a VBD cloth skin interacting with a rigid spherical indenter
 - Add repeatable `--warp-config KEY=VALUE` CLI option for overriding `warp.config` attributes when running examples
 - Add 3D texture-based SDF, replacing NanoVDB volumes in the mesh-mesh collision pipeline for improved performance and CPU compatibility.
 - Parse URDF joint `limit effort="..."` values and propagate them to imported revolute and prismatic joint `effort_limit` settings
