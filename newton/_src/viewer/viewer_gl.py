@@ -221,6 +221,11 @@ class ViewerGL(ViewerBase):
         self._scalar_accumulators: dict[str, list[float]] = {}
         self._scalar_smoothing: dict[str, int] = {}
         self._array_buffers: dict[str, np.ndarray] = {}
+        self._array_dirty: set[str] = set()
+        self._array_textures: dict[str, dict[str, Any]] = {}
+        self._heatmap_min_cell_pixels = 3.0
+        self._heatmap_nan_rgba = np.array([51, 51, 51, 255], dtype=np.uint8)
+        self._heatmap_color_lut = self._build_heatmap_color_lut()
         self._plot_history_size = plot_history_size
 
         super().__init__()
@@ -313,6 +318,30 @@ class ViewerGL(ViewerBase):
             pbo_id = (gl.GLuint * 1)(self._pbo)
             gl.glDeleteBuffers(1, pbo_id)
             self._pbo = None
+
+    def _delete_array_texture(self, name: str):
+        texture_state = self._array_textures.pop(name, None)
+        if texture_state is None:
+            return
+        gl = getattr(RendererGL, "gl", None)
+        texture_id = texture_state.get("texture_id")
+        if gl is None or texture_id is None:
+            return
+        texture_ids = (gl.GLuint * 1)(texture_id)
+        gl.glDeleteTextures(1, texture_ids)
+
+    def _clear_array_textures(self):
+        if not self._array_textures:
+            return
+        gl = getattr(RendererGL, "gl", None)
+        if gl is None:
+            self._array_textures.clear()
+            return
+        texture_ids = [state["texture_id"] for state in self._array_textures.values() if state.get("texture_id")]
+        if texture_ids:
+            gl_ids = (gl.GLuint * len(texture_ids))(*texture_ids)
+            gl.glDeleteTextures(len(texture_ids), gl_ids)
+        self._array_textures.clear()
 
     def register_ui_callback(
         self,
@@ -446,6 +475,9 @@ class ViewerGL(ViewerBase):
         self._scalar_arrays.clear()
         self._scalar_accumulators.clear()
         self._scalar_smoothing.clear()
+        self._array_buffers.clear()
+        self._array_dirty.clear()
+        self._clear_array_textures()
 
         super().clear_model()
 
@@ -1221,21 +1253,23 @@ class ViewerGL(ViewerBase):
             cache["colors_uploaded"] = True
 
     @override
-    def log_array(self, name: str, array: wp.array[Any] | np.ndarray):
+    def log_array(self, name: str, array: wp.array[Any] | np.ndarray | None):
         """
         Log a numeric array for visualization.
 
         Args:
             name: Unique path/name for the array signal.
-            array: Array data to visualize.
+            array: Array data to visualize, or ``None`` to remove a previously
+                logged array.
         """
         if array is None:
             self._array_buffers.pop(name, None)
+            self._array_dirty.discard(name)
+            self._delete_array_texture(name)
             return
 
         array_np = array.numpy() if isinstance(array, wp.array) else np.asarray(array)
         array_np = np.asarray(array_np, dtype=np.float32)
-        array_np = np.squeeze(array_np)
 
         if array_np.ndim == 0:
             array_np = array_np.reshape(1, 1)
@@ -1245,6 +1279,7 @@ class ViewerGL(ViewerBase):
             raise ValueError("ViewerGL.log_array only supports scalar, 1-D, or 2-D arrays.")
 
         self._array_buffers[name] = np.ascontiguousarray(array_np)
+        self._array_dirty.add(name)
 
     @override
     def log_scalar(
@@ -1606,6 +1641,8 @@ class ViewerGL(ViewerBase):
         """
         Close the viewer and clean up resources.
         """
+        self._clear_array_textures()
+        self._invalidate_pbo()
         self.renderer.close()
 
     @property
@@ -2342,8 +2379,7 @@ class ViewerGL(ViewerBase):
         imgui.end()
 
     @staticmethod
-    def _heatmap_color(value: float) -> tuple[float, float, float]:
-        t = float(np.clip(value, 0.0, 1.0))
+    def _build_heatmap_color_lut() -> np.ndarray:
         inferno_stops = (
             (0.0, (0.001, 0.000, 0.014)),
             (0.2, (0.169, 0.042, 0.341)),
@@ -2352,13 +2388,124 @@ class ViewerGL(ViewerBase):
             (0.8, (0.944, 0.403, 0.121)),
             (1.0, (0.988, 0.998, 0.645)),
         )
-        for index in range(len(inferno_stops) - 1):
-            t0, c0 = inferno_stops[index]
-            t1, c1 = inferno_stops[index + 1]
-            if t <= t1:
-                alpha = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
-                return tuple(float((1.0 - alpha) * c0[channel] + alpha * c1[channel]) for channel in range(3))
-        return inferno_stops[-1][1]
+        lut = np.empty((256, 4), dtype=np.uint8)
+        for index, value in enumerate(np.linspace(0.0, 1.0, 256, dtype=np.float32)):
+            for stop_index in range(len(inferno_stops) - 1):
+                t0, c0 = inferno_stops[stop_index]
+                t1, c1 = inferno_stops[stop_index + 1]
+                if value <= t1:
+                    alpha = 0.0 if t1 <= t0 else (float(value) - t0) / (t1 - t0)
+                    rgb = [round(255.0 * ((1.0 - alpha) * c0[channel] + alpha * c1[channel])) for channel in range(3)]
+                    lut[index, :3] = rgb
+                    lut[index, 3] = 255
+                    break
+            else:
+                lut[index, :3] = [round(255.0 * channel) for channel in inferno_stops[-1][1]]
+                lut[index, 3] = 255
+        return lut
+
+    @staticmethod
+    def _downsample_heatmap(array: np.ndarray, target_rows: int, target_cols: int) -> np.ndarray:
+        rows, cols = array.shape
+        if rows <= target_rows and cols <= target_cols:
+            return array
+
+        row_factor = max(1, (rows + target_rows - 1) // target_rows)
+        col_factor = max(1, (cols + target_cols - 1) // target_cols)
+        new_rows = max(1, rows // row_factor)
+        new_cols = max(1, cols // col_factor)
+        if new_rows == rows and new_cols == cols:
+            return array
+
+        trimmed = array[: new_rows * row_factor, : new_cols * col_factor]
+        finite_mask = np.isfinite(trimmed)
+        safe_values = np.where(finite_mask, trimmed, 0.0)
+        reshaped_shape = (new_rows, row_factor, new_cols, col_factor)
+        value_sum = safe_values.reshape(reshaped_shape).sum(axis=(1, 3), dtype=np.float64)
+        value_count = finite_mask.reshape(reshaped_shape).sum(axis=(1, 3))
+        downsampled = np.full((new_rows, new_cols), np.nan, dtype=np.float32)
+        np.divide(value_sum, value_count, out=downsampled, where=value_count > 0)
+        return downsampled
+
+    def _colorize_heatmap(self, array: np.ndarray) -> tuple[np.ndarray, float, float]:
+        finite_mask = np.isfinite(array)
+        if not np.any(finite_mask):
+            rgba = np.empty((*array.shape, 4), dtype=np.uint8)
+            rgba[...] = self._heatmap_nan_rgba
+            return np.ascontiguousarray(rgba[::-1]), float("nan"), float("nan")
+
+        finite_values = array[finite_mask]
+        value_min = float(np.min(finite_values))
+        value_max = float(np.max(finite_values))
+        denom = max(value_max - value_min, 1.0e-8)
+
+        normalized = np.zeros(array.shape, dtype=np.float32)
+        np.subtract(array, value_min, out=normalized, where=finite_mask)
+        np.divide(normalized, denom, out=normalized, where=finite_mask)
+        np.clip(normalized, 0.0, 1.0, out=normalized)
+
+        lut_indices = np.rint(normalized * 255.0).astype(np.uint8)
+        rgba = self._heatmap_color_lut[lut_indices].copy()
+        rgba[~finite_mask] = self._heatmap_nan_rgba
+        return np.ascontiguousarray(rgba[::-1]), value_min, value_max
+
+    def _ensure_array_texture(self, name: str, width: int, height: int) -> dict[str, Any]:
+        texture_state = self._array_textures.get(name)
+        if texture_state is not None and texture_state["size"] == (width, height):
+            return texture_state
+
+        if texture_state is not None:
+            self._delete_array_texture(name)
+
+        gl = RendererGL.gl
+        texture_id = (gl.GLuint * 1)()
+        gl.glGenTextures(1, texture_id)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id[0])
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE)
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            gl.GL_RGBA8,
+            width,
+            height,
+            0,
+            gl.GL_RGBA,
+            gl.GL_UNSIGNED_BYTE,
+            None,
+        )
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+
+        texture_state = {
+            "texture_id": texture_id[0],
+            "size": (width, height),
+            "source_shape": None,
+            "display_shape": None,
+            "value_min": 0.0,
+            "value_max": 0.0,
+        }
+        self._array_textures[name] = texture_state
+        return texture_state
+
+    def _update_array_texture(self, texture_id: int, rgba: np.ndarray):
+        gl = RendererGL.gl
+        gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id)
+        gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1)
+        gl.glTexSubImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            rgba.shape[1],
+            rgba.shape[0],
+            gl.GL_RGBA,
+            gl.GL_UNSIGNED_BYTE,
+            rgba.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
+        )
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
     def _render_array_heatmap(self, name: str, array: np.ndarray, width: float):
         imgui = self.ui.imgui
@@ -2366,37 +2513,28 @@ class ViewerGL(ViewerBase):
         rows, cols = array.shape
         heatmap_width = max(120.0, width)
         heatmap_height = np.clip(heatmap_width * rows / max(cols, 1), 80.0, 220.0)
-        cell_width = heatmap_width / max(cols, 1)
-        cell_height = heatmap_height / max(rows, 1)
+        target_cols = max(1, min(cols, int(heatmap_width / self._heatmap_min_cell_pixels)))
+        target_rows = max(1, min(rows, int(heatmap_height / self._heatmap_min_cell_pixels)))
+        display_array = self._downsample_heatmap(array, target_rows, target_cols)
+        display_rows, display_cols = display_array.shape
+        texture_state = self._ensure_array_texture(name, display_cols, display_rows)
 
-        finite_mask = np.isfinite(array)
-        if np.any(finite_mask):
-            finite_values = array[finite_mask]
-            value_min = float(np.min(finite_values))
-            value_max = float(np.max(finite_values))
-        else:
-            value_min = 0.0
-            value_max = 0.0
+        if (
+            name in self._array_dirty
+            or texture_state["source_shape"] != array.shape
+            or texture_state["display_shape"] != display_array.shape
+        ):
+            rgba, value_min, value_max = self._colorize_heatmap(display_array)
+            self._update_array_texture(texture_state["texture_id"], rgba)
+            texture_state["source_shape"] = array.shape
+            texture_state["display_shape"] = display_array.shape
+            texture_state["value_min"] = value_min
+            texture_state["value_max"] = value_max
+            self._array_dirty.discard(name)
 
-        denom = max(value_max - value_min, 1.0e-8)
         draw_list = imgui.get_window_draw_list()
         origin = imgui.get_cursor_screen_pos()
-
-        for row in range(rows):
-            for col in range(cols):
-                value = float(array[row, col])
-                if np.isfinite(value):
-                    normalized = (value - value_min) / denom
-                    color_rgb = self._heatmap_color(normalized)
-                else:
-                    color_rgb = (0.2, 0.2, 0.2)
-                color_u32 = imgui.color_convert_float4_to_u32(imgui.ImVec4(*color_rgb, 1.0))
-
-                x0 = origin.x + col * cell_width
-                y0 = origin.y + (rows - 1 - row) * cell_height
-                x1 = origin.x + (col + 1) * cell_width
-                y1 = y0 + cell_height
-                draw_list.add_rect_filled(imgui.ImVec2(x0, y0), imgui.ImVec2(x1, y1), color_u32)
+        imgui.image(imgui.ImTextureRef(texture_state["texture_id"]), imgui.ImVec2(heatmap_width, heatmap_height))
 
         border_color = imgui.color_convert_float4_to_u32(imgui.ImVec4(1.0, 1.0, 1.0, 0.25))
         draw_list.add_rect(
@@ -2404,8 +2542,14 @@ class ViewerGL(ViewerBase):
             imgui.ImVec2(origin.x + heatmap_width, origin.y + heatmap_height),
             border_color,
         )
-        imgui.dummy(imgui.ImVec2(heatmap_width, heatmap_height))
-        imgui.text(f"shape {rows}x{cols}  min {value_min:.4g}  max {value_max:.4g}")
+        shape_text = f"shape {rows}x{cols}"
+        if (display_rows, display_cols) != (rows, cols):
+            shape_text += f"  shown {display_rows}x{display_cols}"
+        if np.isfinite(texture_state["value_min"]) and np.isfinite(texture_state["value_max"]):
+            range_text = f"min {texture_state['value_min']:.4g}  max {texture_state['value_max']:.4g}"
+        else:
+            range_text = "min --  max --"
+        imgui.text(f"{shape_text}  {range_text}")
 
     def _render_scalar_plots(self):
         """Render an ImGui window with live line plots and array heatmaps."""
