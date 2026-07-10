@@ -8,6 +8,7 @@ import warp as wp
 
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, State
+from ...utils.deprecation import deprecate_nonkeyword_arguments
 from ..contact_force_export import fill_vbd_like_soft_contact_force_rows
 from ..solver import SolverBase
 from .builder import PDMatrixBuilder
@@ -101,9 +102,11 @@ class SolverStyle3D(SolverBase):
 
     """
 
+    @deprecate_nonkeyword_arguments
     def __init__(
         self,
         model: Model,
+        *,
         iterations: int = 10,
         linear_iterations: int = 10,
         drag_spring_stiff: float = 1e2,
@@ -345,7 +348,9 @@ class SolverStyle3D(SolverBase):
         if contacts.force is None:
             raise ValueError("Contacts.force is None. Request the extended contact attribute 'force' first.")
         if self._last_dt is None:
-            raise ValueError("SolverStyle3D.update_contacts requires a completed solver step before contact forces are available.")
+            raise ValueError(
+                "SolverStyle3D.update_contacts requires a completed solver step before contact forces are available."
+            )
 
         contacts.force.zero_()
         soft_count = int(contacts.soft_contact_count.numpy()[0])
@@ -374,7 +379,8 @@ class SolverStyle3D(SolverBase):
             contact_ke=np.full(soft_count, float(self.model.soft_contact_ke), dtype=np.float32),
             contact_kd=np.full(soft_count, float(self.model.soft_contact_kd), dtype=np.float32),
             contact_mu=np.sqrt(
-                float(self.model.soft_contact_mu) * self.model.shape_material_mu.numpy()[contacts.soft_contact_shape.numpy()[:soft_count]]
+                float(self.model.soft_contact_mu)
+                * self.model.shape_material_mu.numpy()[contacts.soft_contact_shape.numpy()[:soft_count]]
             ).astype(np.float32, copy=False),
             soft_contact_margin=soft_contact_margin,
             friction_epsilon=float(self.collision.friction_epsilon) if self.collision is not None else 1.0e-2,

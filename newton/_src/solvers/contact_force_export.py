@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 
 from ..geometry import ParticleFlags
@@ -74,9 +72,13 @@ def fill_vbd_like_soft_contact_force_rows(
             if body_q_prev is not None:
                 body_pos_prev = transform_point_np(body_q_prev[body_idx], contact_body_pos[contact_idx])
                 body_vel_world = ((body_pos_world - body_pos_prev) / dt).astype(np.float32, copy=False)
-                body_vel_world += transform_vector_np(xform, contact_body_vel[contact_idx]).astype(np.float32, copy=False)
+                body_vel_world += transform_vector_np(xform, contact_body_vel[contact_idx]).astype(
+                    np.float32, copy=False
+                )
             else:
-                body_vel_world = transform_vector_np(xform, contact_body_vel[contact_idx]).astype(np.float32, copy=False)
+                body_vel_world = transform_vector_np(xform, contact_body_vel[contact_idx]).astype(
+                    np.float32, copy=False
+                )
                 if body_qd is not None and body_com is not None:
                     com_world = transform_point_np(xform, body_com[body_idx]).astype(np.float32, copy=False)
                     point_offset = body_pos_world - com_world

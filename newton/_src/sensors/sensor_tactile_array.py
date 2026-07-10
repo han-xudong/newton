@@ -160,7 +160,9 @@ def accumulate_estimated_tactile_forces_kernel(
         point_offset = body_pos_world - body_origin
         body_vel_world = body_vel_world + velocity_at_point(body_qd[body_index], point_offset)
 
-    penetration_depth = -(wp.dot(normal, particle_pos - body_pos_world) - particle_radius[particle_index] - contact_margin)
+    penetration_depth = -(
+        wp.dot(normal, particle_pos - body_pos_world) - particle_radius[particle_index] - contact_margin
+    )
     if penetration_depth <= 0.0:
         return
 
@@ -323,7 +325,9 @@ class SensorTactileArray:
         self.official_coverage_ratio = 0.0
 
         self._particle_to_grid = np.full(particle_count, -1, dtype=np.int32)
-        self._particle_to_grid[np.asarray(sensing_particles, dtype=np.int32)] = np.arange(len(sensing_particles), dtype=np.int32)
+        self._particle_to_grid[np.asarray(sensing_particles, dtype=np.int32)] = np.arange(
+            len(sensing_particles), dtype=np.int32
+        )
         self._particle_to_grid_wp = wp.array(self._particle_to_grid, dtype=wp.int32, device=self.device)
 
         if counterpart_bodies is not None:
@@ -331,7 +335,9 @@ class SensorTactileArray:
             body_count = len(model.body_label)
             for body_idx in bodies:
                 if body_idx < 0 or body_idx >= body_count:
-                    raise IndexError(f"counterpart_bodies contains index {body_idx}, but model only has {body_count} bodies")
+                    raise IndexError(
+                        f"counterpart_bodies contains index {body_idx}, but model only has {body_count} bodies"
+                    )
             shape_body = model.shape_body.numpy()
             shape_indices = np.where(np.isin(shape_body, np.asarray(bodies, dtype=np.int32)))[0].tolist()
         elif counterpart_shapes is not None:

@@ -9,10 +9,7 @@ import warp as wp
 
 import newton
 from newton.sensors import SensorTactileArray
-from newton.solvers import SolverSemiImplicit
-from newton.solvers import SolverVBD
-from newton.solvers import SolverStyle3D
-from newton.solvers import style3d
+from newton.solvers import SolverSemiImplicit, SolverStyle3D, SolverVBD, style3d
 
 
 def _make_cloth_model(device):
@@ -446,7 +443,9 @@ class TestSensorTactileArray(unittest.TestCase):
         shear_map1 = sensor.shear_force_map.numpy()
         force_map1 = sensor.force_map.numpy()
         base_normal_load = (0.05 - 0.044) * model.soft_contact_ke
-        expected_shear = float(np.sqrt(model.soft_contact_mu * model.shape_material_mu.numpy()[shape]) * base_normal_load)
+        expected_shear = float(
+            np.sqrt(model.soft_contact_mu * model.shape_material_mu.numpy()[shape]) * base_normal_load
+        )
 
         self.assertAlmostEqual(float(normal_map1[0, 0]), 0.7, places=5)
         self.assertAlmostEqual(float(shear_map1[0, 0]), expected_shear, places=5)
